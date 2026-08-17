@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 from mnemosyne.core import embeddings as _embeddings
 from mnemosyne.core.beam import BeamMemory, init_beam
+from .journal import journal_mode
 _thread_local = threading.local()
 
 # Default data directory
@@ -64,7 +65,7 @@ def _get_connection(db_path = None) -> sqlite3.Connection:
         path.parent.mkdir(parents=True, exist_ok=True)
         _thread_local.conn = sqlite3.connect(str(path), check_same_thread=False)
         _thread_local.conn.row_factory = sqlite3.Row
-        _thread_local.conn.execute("PRAGMA journal_mode=WAL")
+        _thread_local.conn.execute(f"PRAGMA journal_mode={journal_mode()}")
         _thread_local.conn.execute("PRAGMA busy_timeout=5000")
         _thread_local.conn.execute("PRAGMA foreign_keys=ON")
         # Load sqlite-vec extension for vector search (matches beam._get_connection)

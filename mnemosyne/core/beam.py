@@ -25,6 +25,7 @@ import math
 from dataclasses import dataclass
 
 from mnemosyne.core.config import resolve_beam_runtime
+from .journal import journal_mode
 
 logger = logging.getLogger(__name__)
 from datetime import datetime, timedelta, timezone
@@ -462,7 +463,7 @@ def _get_connection(db_path: Path = None) -> sqlite3.Connection:
             factory=_BeamConnection,
         )
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(f"PRAGMA journal_mode={journal_mode()}")
         # Configurable so deployments with long consolidation write windows
         # can let tool calls ride them out instead of failing with
         # "database is locked" after a hardcoded 5s.
