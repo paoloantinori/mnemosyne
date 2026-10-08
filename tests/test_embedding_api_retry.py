@@ -651,7 +651,12 @@ def test_policy_refusal_reports_redirect_kind_while_api_route_active(monkeypatch
 
     assert "attacker.example" in embeddings.policy_refusal_message()
 
+    # Leaving the API route (local model, URL dropped) drops the redirect
+    # report: the stale refusal must not be reported against a configuration
+    # that can no longer refuse it.
     monkeypatch.setattr(embeddings, "_DEFAULT_MODEL", "BAAI/bge-small-en-v1.5")
+    monkeypatch.delenv("MNEMOSYNE_EMBEDDINGS_VIA_API", raising=False)
+    monkeypatch.delenv("MNEMOSYNE_EMBEDDING_API_URL", raising=False)
     assert embeddings.policy_refusal_message() is None
 
 
