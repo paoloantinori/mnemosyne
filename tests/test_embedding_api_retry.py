@@ -639,6 +639,22 @@ def test_policy_refusal_derived_statically_without_embed_call(monkeypatch):
     assert embeddings.policy_refusal_message() is None
 
 
+def test_policy_refusal_reports_redirect_kind_while_api_route_active(monkeypatch):
+    # A credentialed-redirect refusal has no static signal: while the API
+    # route stays active the status keeps reporting the last one raised, and
+    # an operator who switches to the local model stops seeing it.
+    _api_env(monkeypatch, base_url="https://example.test/v1")
+    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "secret-key")
+    monkeypatch.setattr(embeddings, "_ANNOUNCED_POLICY_REFUSALS", set())
+    monkeypatch.setattr(embeddings, "_LAST_POLICY_REFUSAL", ("credentialed-redirect", "redirect to attacker.example"))
+    monkeypatch.setattr(embeddings, "_DEFAULT_MODEL", "openai/text-embedding-3-small")
+
+    assert "attacker.example" in embeddings.policy_refusal_message()
+
+    monkeypatch.setattr(embeddings, "_DEFAULT_MODEL", "BAAI/bge-small-en-v1.5")
+    assert embeddings.policy_refusal_message() is None
+
+
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
 def test_embed_raises_on_non_finite_api_vector(monkeypatch, value):
     # A NaN/infinity response passes the shape and count checks but serializes
