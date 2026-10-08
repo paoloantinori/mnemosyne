@@ -590,9 +590,10 @@ def test_policy_refusal_state_resets_after_successful_embed(monkeypatch):
     monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", None)
     data = {"data": [{"embedding": [0.1, 0.2]}]}
     with patch("urllib.request.urlopen", return_value=Response(data)):
-        vectors = embeddings._embed_api(["anything"])
+        vectors = embeddings.embed(["anything"])
 
     assert vectors is not None and vectors.shape[0] == 1
+    assert embeddings._LAST_POLICY_REFUSAL is None
     assert embeddings.policy_refusal_message() is None
 
 
@@ -640,20 +641,53 @@ def test_policy_refusal_derived_statically_without_embed_call(monkeypatch):
 
 
 def test_policy_refusal_reports_redirect_kind_while_api_route_active(monkeypatch):
-    # A credentialed-redirect refusal has no static signal: while the API
-    # route stays active the status keeps reporting the last one raised, and
-    # an operator who switches to the local model stops seeing it.
+    # A credentialed-redirect refusal has no static signal: it is reported
+    # while the API route stays active, cleared by a validated embed, and
+    # dropped entirely once the configuration can no longer refuse anything.
+    # The refusal is raised through the real handler, not by seeding state,
+    # so the test fails if the raise funnel stops recording the kind.
     _api_env(monkeypatch, base_url="https://example.test/v1")
     monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "secret-key")
     monkeypatch.setattr(embeddings, "_ANNOUNCED_POLICY_REFUSALS", set())
-    monkeypatch.setattr(embeddings, "_LAST_POLICY_REFUSAL", ("credentialed-redirect", "redirect to attacker.example"))
+    monkeypatch.setattr(embeddings, "_LAST_POLICY_REFUSAL", None)
     monkeypatch.setattr(embeddings, "_DEFAULT_MODEL", "openai/text-embedding-3-small")
 
+    import urllib.request
+
+    handler = embeddings._CredentialedNoRedirect()
+    request = urllib.request.Request(
+        "https://example.test/v1/embeddings",
+        headers={"Authorization": "Bearer secret"},
+    )
+
+    def _refuse_redirect():
+        with pytest.raises(embeddings.EmbeddingPolicyError):
+            handler.redirect_request(
+                request, None, 302, "Found", {}, "https://attacker.example/embed"
+            )
+
+    _refuse_redirect()
     assert "attacker.example" in embeddings.policy_refusal_message()
 
-    # Leaving the API route (local model, URL dropped) drops the redirect
-    # report: the stale refusal must not be reported against a configuration
-    # that can no longer refuse it.
+    # A validated embed on the same route clears the recorded refusal. The
+    # clear lives in _ensure_api_vectors, so it must be observed through
+    # embed(); the uncredentialed branch keeps the plain-urlopen path that
+    # the response stub patches.
+    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", None)
+    data = {"data": [{"embedding": [0.1, 0.2]}]}
+    with patch("urllib.request.urlopen", return_value=Response(data)):
+        vectors = embeddings.embed(["anything"])
+    assert vectors is not None and vectors.shape[0] == 1
+    assert embeddings._LAST_POLICY_REFUSAL is None
+    assert embeddings.policy_refusal_message() is None
+
+    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "secret-key")
+    _refuse_redirect()
+    assert "attacker.example" in embeddings.policy_refusal_message()
+
+    # Leaving the API route (local model, opt-in flag and URL dropped) drops
+    # the redirect report: the stale refusal must not be reported against a
+    # configuration that can no longer refuse it.
     monkeypatch.setattr(embeddings, "_DEFAULT_MODEL", "BAAI/bge-small-en-v1.5")
     monkeypatch.delenv("MNEMOSYNE_EMBEDDINGS_VIA_API", raising=False)
     monkeypatch.delenv("MNEMOSYNE_EMBEDDING_API_URL", raising=False)
