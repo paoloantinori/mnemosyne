@@ -498,7 +498,7 @@ def test_hindsight_import_continues_without_vector_when_embedding_raises(monkeyp
 # ---------------------------------------------------------------------------
 
 def test_credentialed_cleartext_policy_error_redacts_url(monkeypatch, caplog):
-    # _EmbeddingPolicyError interpolated the raw endpoint URL, so userinfo and
+    # EmbeddingPolicyError interpolated the raw endpoint URL, so userinfo and
     # query secrets could reach the exception text and the fail-soft consumer
     # logs. Both must carry only the redacted endpoint.
     monkeypatch.setenv(
@@ -507,13 +507,15 @@ def test_credentialed_cleartext_policy_error_redacts_url(monkeypatch, caplog):
     )
     monkeypatch.setenv("MNEMOSYNE_EMBEDDINGS_VIA_API", "1")
     monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "secret-key")
+    monkeypatch.setattr(embeddings, "_ANNOUNCED_POLICY_REFUSALS", set())
+    monkeypatch.setattr(embeddings, "_LAST_POLICY_REFUSAL", None)
 
     def _no_request(*args, **kwargs):
         raise AssertionError("no request may be attempted for a cleartext credentialed endpoint")
 
     monkeypatch.setattr(embeddings.urllib.request, "urlopen", _no_request)
     with caplog.at_level(logging.WARNING, logger="mnemosyne.core.embeddings"):
-        with pytest.raises(embeddings._EmbeddingPolicyError) as excinfo:
+        with pytest.raises(embeddings.EmbeddingPolicyError) as excinfo:
             embeddings._embed_api(["private memory content"])
 
     message = str(excinfo.value)
@@ -524,11 +526,13 @@ def test_credentialed_cleartext_policy_error_redacts_url(monkeypatch, caplog):
         assert leaked not in caplog.text
 
 
-def test_credentialed_redirect_policy_error_redacts_target_url():
+def test_credentialed_redirect_policy_error_redacts_target_url(monkeypatch):
     # The redirect refusal echoed the raw Location target, which can carry
     # userinfo or query secrets. It must be redacted before formatting.
     import urllib.request
 
+    monkeypatch.setattr(embeddings, "_ANNOUNCED_POLICY_REFUSALS", set())
+    monkeypatch.setattr(embeddings, "_LAST_POLICY_REFUSAL", None)
     handler = embeddings._CredentialedNoRedirect()
     request = urllib.request.Request(
         "https://configured.example/v1/embeddings",
@@ -536,7 +540,7 @@ def test_credentialed_redirect_policy_error_redacts_target_url():
     )
     newurl = "http://user:password@attacker.example/embed?token=secret"
 
-    with pytest.raises(embeddings._EmbeddingPolicyError) as excinfo:
+    with pytest.raises(embeddings.EmbeddingPolicyError) as excinfo:
         handler.redirect_request(request, None, 302, "Found", {"Location": newurl}, newurl)
 
     message = str(excinfo.value)
@@ -544,6 +548,95 @@ def test_credentialed_redirect_policy_error_redacts_target_url():
     assert "http://attacker.example/embed" in message
     assert "user:password" not in message
     assert "token=secret" not in message
+
+
+def test_policy_refusal_announces_loudly_once(monkeypatch, caplog):
+    # The fail-loud contract must survive the broad except blocks up the
+    # stack (beam et al. degrade any embedding failure to keyword-only
+    # recall): the refusal logs at ERROR once per refusal kind per process,
+    # then still raises for callers that listen; the status surface keeps
+    # the latest refused endpoint.
+    _api_env(monkeypatch, base_url="http://example.test/v1")
+    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "secret-key")
+    monkeypatch.setattr(embeddings, "_ANNOUNCED_POLICY_REFUSALS", set())
+    monkeypatch.setattr(embeddings, "_LAST_POLICY_REFUSAL", None)
+
+    with caplog.at_level(logging.ERROR, logger="mnemosyne.core.embeddings"):
+        with pytest.raises(embeddings.EmbeddingPolicyError):
+            embeddings._embed_api(["private memory content"])
+        # A different cleartext endpoint is the same refusal KIND: the
+        # announcement stays once, while the status keeps the latest message.
+        monkeypatch.setenv("MNEMOSYNE_EMBEDDING_API_URL", "http://other.example/v1")
+        with pytest.raises(embeddings.EmbeddingPolicyError):
+            embeddings._embed_api(["private memory content"])
+
+    assert "other.example" in embeddings.policy_refusal_message()
+    assert caplog.text.count("policy refusal") == 1
+
+
+def test_policy_refusal_state_resets_after_successful_embed(monkeypatch):
+    # _embed_api re-reads the environment per call, so a configuration fixed
+    # mid-process must stop reporting the stale refusal on the status surface.
+    _api_env(monkeypatch, base_url="http://example.test/v1")
+    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "secret-key")
+    monkeypatch.setattr(embeddings, "_ANNOUNCED_POLICY_REFUSALS", set())
+    monkeypatch.setattr(embeddings, "_LAST_POLICY_REFUSAL", None)
+
+    with pytest.raises(embeddings.EmbeddingPolicyError):
+        embeddings._embed_api(["anything"])
+    assert embeddings.policy_refusal_message() is not None
+
+    _api_env(monkeypatch, base_url="https://example.test/v1")
+    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", None)
+    data = {"data": [{"embedding": [0.1, 0.2]}]}
+    with patch("urllib.request.urlopen", return_value=Response(data)):
+        vectors = embeddings._embed_api(["anything"])
+
+    assert vectors is not None and vectors.shape[0] == 1
+    assert embeddings.policy_refusal_message() is None
+
+
+def test_policy_refusal_failed_emit_releases_the_claim(monkeypatch):
+    # A failed announcement must not consume the refusal kind: the next
+    # refusal of the same kind retries the ERROR log instead of staying
+    # silent for the process lifetime.
+    _api_env(monkeypatch, base_url="http://example.test/v1")
+    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "secret-key")
+    monkeypatch.setattr(embeddings, "_ANNOUNCED_POLICY_REFUSALS", set())
+    monkeypatch.setattr(embeddings, "_LAST_POLICY_REFUSAL", None)
+    attempts = []
+
+    def _flaky_error(fmt, *args):
+        attempts.append("attempt")
+        if len(attempts) == 1:
+            raise OSError("handler broke")
+        attempts[-1] = "ok"
+
+    monkeypatch.setattr(embeddings.logger, "error", _flaky_error)
+    with pytest.raises(embeddings.EmbeddingPolicyError):
+        embeddings._embed_api(["x"])
+    with pytest.raises(embeddings.EmbeddingPolicyError):
+        embeddings._embed_api(["x"])
+
+    assert attempts == ["attempt", "ok"]
+
+
+def test_policy_refusal_derived_statically_without_embed_call(monkeypatch):
+    # doctor and diagnose never embed, so the refusal must be derivable from
+    # configuration alone for their status surfaces to report it; the private
+    # name from released tags keeps working as an alias of the public one.
+    _api_env(monkeypatch, base_url="http://example.test/v1")
+    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "secret-key")
+    monkeypatch.setattr(embeddings, "_ANNOUNCED_POLICY_REFUSALS", set())
+    monkeypatch.setattr(embeddings, "_LAST_POLICY_REFUSAL", None)
+
+    message = embeddings.policy_refusal_message()
+    assert message is not None
+    assert "http://example.test/v1" in message
+    assert embeddings._EmbeddingPolicyError is embeddings.EmbeddingPolicyError
+
+    _api_env(monkeypatch, base_url="https://example.test/v1")
+    assert embeddings.policy_refusal_message() is None
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
