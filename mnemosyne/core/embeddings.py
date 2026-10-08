@@ -145,7 +145,10 @@ def _is_api_model(model_name: str) -> bool:
         return True
     # Custom endpoint: if MNEMOSYNE_EMBEDDING_API_URL is set to a non-OpenRouter URL,
     # assume the user has their own API server and any model name should route there.
-    if not _is_openrouter_url(_effective_base_url()):
+    # The empty default is deliberate here: with no URL configured the model
+    # routes locally, unlike _effective_base_url()'s OpenRouter fallback.
+    base_url = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "")
+    if base_url and not _is_openrouter_url(base_url):
         return True
     # Explicit opt-in for non-OpenAI embedding models hosted on OpenRouter
     # (qwen/qwen3-embedding-*, baai/bge-*, jina-embeddings-*, nvidia/*-embed-*, etc.).
