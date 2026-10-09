@@ -50,6 +50,17 @@ class Response:
         return self.body.read()
 
 
+class StubOpener:
+    """Stands in for the opener a key-bearing embed builds, so the
+    credentialed recovery path can be exercised without network."""
+
+    def __init__(self, response):
+        self._response = response
+
+    def open(self, req, timeout=None):
+        return self._response
+
+
 def test_embed_api_retries_transient_network_failures(monkeypatch):
     monkeypatch.setenv("MNEMOSYNE_EMBEDDING_API_URL", "http://127.0.0.1:11435/v1")
     result = Response({"data": [{"embedding": [0.25, 0.75]}]})
@@ -577,6 +588,10 @@ def test_policy_refusal_announces_loudly_once(monkeypatch, caplog):
 def test_policy_refusal_state_resets_after_successful_embed(monkeypatch):
     # _embed_api re-reads the environment per call, so a configuration fixed
     # mid-process must stop reporting the stale refusal on the status surface.
+    # The recovery runs credentialed (the realistic shape: the key stays and
+    # the URL becomes https), through the opener path a key-bearing embed
+    # actually takes; a garbage response must NOT clear the refusal, only a
+    # validated one may.
     _api_env(monkeypatch, base_url="http://example.test/v1")
     monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "secret-key")
     monkeypatch.setattr(embeddings, "_ANNOUNCED_POLICY_REFUSALS", set())
@@ -587,9 +602,17 @@ def test_policy_refusal_state_resets_after_successful_embed(monkeypatch):
     assert embeddings.policy_refusal_message() is not None
 
     _api_env(monkeypatch, base_url="https://example.test/v1")
-    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", None)
+
+    garbage = {"data": [{"embedding": [float("nan")]}]}
+    with patch("urllib.request.build_opener", return_value=StubOpener(Response(garbage))):
+        with pytest.raises(RuntimeError, match="non-finite"):
+            embeddings.embed(["anything"])
+    # The cleartext kind is superseded by the healthy static gate, so the
+    # preserved refusal is asserted on the recorded state itself.
+    assert embeddings._LAST_POLICY_REFUSAL is not None
+
     data = {"data": [{"embedding": [0.1, 0.2]}]}
-    with patch("urllib.request.urlopen", return_value=Response(data)):
+    with patch("urllib.request.build_opener", return_value=StubOpener(Response(data))):
         vectors = embeddings.embed(["anything"])
 
     assert vectors is not None and vectors.shape[0] == 1
@@ -669,19 +692,23 @@ def test_policy_refusal_reports_redirect_kind_while_api_route_active(monkeypatch
     _refuse_redirect()
     assert "attacker.example" in embeddings.policy_refusal_message()
 
-    # A validated embed on the same route clears the recorded refusal. The
-    # clear lives in _ensure_api_vectors, so it must be observed through
-    # embed(); the uncredentialed branch keeps the plain-urlopen path that
-    # the response stub patches.
-    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", None)
+    # An invalid response must NOT clear the recorded refusal; the redirect
+    # kind is what the accessor reports, so both sides of the contract are
+    # asserted through it. The credentialed opener path is stubbed, matching
+    # the key-bearing shape that raised the refusal in the first place.
+    garbage = {"data": [{"embedding": [float("nan")]}]}
+    with patch("urllib.request.build_opener", return_value=StubOpener(Response(garbage))):
+        with pytest.raises(RuntimeError, match="non-finite"):
+            embeddings.embed(["anything"])
+    assert "attacker.example" in embeddings.policy_refusal_message()
+
     data = {"data": [{"embedding": [0.1, 0.2]}]}
-    with patch("urllib.request.urlopen", return_value=Response(data)):
+    with patch("urllib.request.build_opener", return_value=StubOpener(Response(data))):
         vectors = embeddings.embed(["anything"])
     assert vectors is not None and vectors.shape[0] == 1
     assert embeddings._LAST_POLICY_REFUSAL is None
     assert embeddings.policy_refusal_message() is None
 
-    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "secret-key")
     _refuse_redirect()
     assert "attacker.example" in embeddings.policy_refusal_message()
 
