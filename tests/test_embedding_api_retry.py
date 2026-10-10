@@ -3,6 +3,7 @@
 import io
 import json
 import logging
+import threading
 import urllib.error
 from unittest.mock import patch
 
@@ -661,6 +662,57 @@ def test_policy_refusal_derived_statically_without_embed_call(monkeypatch):
 
     _api_env(monkeypatch, base_url="https://example.test/v1")
     assert embeddings.policy_refusal_message() is None
+
+
+def test_policy_refusal_snapshot_survives_concurrent_clears(monkeypatch):
+    # Regression (review 5480062367): the None check and the tuple unpack
+    # used two reads of _LAST_POLICY_REFUSAL, so a concurrent validated
+    # embed clearing the refusal in between raised TypeError inside a
+    # status read, breaking recall(..., explain=True) with it.
+    _api_env(monkeypatch, base_url="https://example.test/v1")
+    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "secret-key")
+    monkeypatch.setattr(embeddings, "_ANNOUNCED_POLICY_REFUSALS", set())
+    monkeypatch.setattr(embeddings, "_DEFAULT_MODEL", "openai/text-embedding-3-small")
+    embeddings._LAST_POLICY_REFUSAL = ("credentialed-redirect", "redirect to attacker.example")
+
+    stop = threading.Event()
+
+    def _churn():
+        while not stop.is_set():
+            embeddings._LAST_POLICY_REFUSAL = None
+            embeddings._LAST_POLICY_REFUSAL = ("credentialed-redirect", "redirect to attacker.example")
+
+    churner = threading.Thread(target=_churn)
+    churner.start()
+    try:
+        for _ in range(500):
+            message = embeddings.policy_refusal_message()
+            assert message is None or "attacker.example" in message
+    finally:
+        stop.set()
+        churner.join()
+
+
+def test_policy_refusal_silent_when_embeddings_disabled(monkeypatch):
+    # Regression (review 5480062367): with embeddings disabled there is no
+    # active embedding route, so a stale redirect refusal must stop being
+    # reported as ERROR; a malformed flag value keeps the no-throw contract.
+    _api_env(monkeypatch, base_url="https://example.test/v1")
+    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "secret-key")
+    monkeypatch.setattr(embeddings, "_ANNOUNCED_POLICY_REFUSALS", set())
+    monkeypatch.setattr(embeddings, "_DEFAULT_MODEL", "openai/text-embedding-3-small")
+    embeddings._LAST_POLICY_REFUSAL = ("credentialed-redirect", "redirect to attacker.example")
+
+    assert "attacker.example" in embeddings.policy_refusal_message()
+
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    assert embeddings.policy_refusal_message() is None
+
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "maybe")
+    assert embeddings.policy_refusal_message() is None
+
+    monkeypatch.delenv("MNEMOSYNE_NO_EMBEDDINGS", raising=False)
+    assert "attacker.example" in embeddings.policy_refusal_message()
 
 
 def test_policy_refusal_reports_redirect_kind_while_api_route_active(monkeypatch):

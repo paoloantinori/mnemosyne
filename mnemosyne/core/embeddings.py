@@ -455,22 +455,26 @@ def policy_refusal_message():
     refusal has no static signal and reports the last one raised in this
     process (cleared again by a successful API embed), so it is visible to
     the serving process's own status surfaces, not to a fresh doctor.
-    Never raises: a malformed configuration flag degrades to the last known
-    state instead of taking down a status read. Lets status surfaces report
-    the degraded mode."""
+    With embeddings disabled entirely there is no active embedding route,
+    so no refusal is reported. Never raises: a malformed configuration
+    flag degrades to no report instead of taking down a status read. Lets
+    status surfaces report the degraded mode."""
     try:
+        if _is_disabled():
+            return None
         static = _static_cleartext_refusal()
+        if static is not None:
+            return static
+        # A redirect refusal has no static signal; report it only while the
+        # API path is still the active model route, so an operator who fixed
+        # the misconfiguration by switching to the local model (or disabling
+        # embeddings) stops seeing it. One snapshot of the tuple: a
+        # concurrent validated embed clears it between separate reads.
+        last = _LAST_POLICY_REFUSAL
+        if last is not None and last[0] == "credentialed-redirect" and _is_api_model(_DEFAULT_MODEL):
+            return last[1]
     except Exception:
-        static = None
-    if static is not None:
-        return static
-    # A redirect refusal has no static signal; report it only while the API
-    # path is still the active model route, so an operator who fixed the
-    # misconfiguration by switching to the local model stops seeing it.
-    if _LAST_POLICY_REFUSAL is not None:
-        refusal_key, message = _LAST_POLICY_REFUSAL
-        if refusal_key == "credentialed-redirect" and _is_api_model(_DEFAULT_MODEL):
-            return message
+        return None
     return None
 
 
